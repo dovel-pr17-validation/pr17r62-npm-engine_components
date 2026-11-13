@@ -818,7 +818,7 @@ __metadata:
   dependencies:
     "@thatopen/components": ~3.6.0
     "@thatopen/fragments": ~3.6.0
-    "@thatopen/ui": ~3.4.17
+    "@thatopen/ui": ~3.4.28
     "@thatopen/ui-obc": ~3.4.4
     "@types/convert-units": 2.3.11
     "@types/earcut": 3.0.0
@@ -844,7 +844,7 @@ __metadata:
   resolution: "@thatopen/components@workspace:packages/core"
   dependencies:
     "@thatopen/fragments": ~3.6.0
-    "@thatopen/ui": ~3.4.17
+    "@thatopen/ui": ~3.4.28
     "@types/convert-units": 2.3.11
     "@types/three": 0.184.0
     "@vitest/coverage-v8": ^5.0.0
@@ -899,7 +899,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"@thatopen/ui@npm:~3.4.0, @thatopen/ui@npm:~3.4.17":
+"@thatopen/ui@npm:~3.4.0":
   version: 3.4.17
   resolution: "@thatopen/ui@npm:3.4.17"
   dependencies:
@@ -909,6 +909,19 @@ __metadata:
     iconify-icon: 3.0.1
     lit: 3.3.1
   checksum: 80e4d433546d78b45a2fb698e4c8a562b85786df50fe5238b8d149acef5c845645d076154822f88bbf768cb805e047e8b80ab327d65452cd3f717eea8843dc7f
+  languageName: node
+  linkType: hard
+
+"@thatopen/ui@npm:~3.4.28":
+  version: 3.4.28
+  resolution: "@thatopen/ui@npm:3.4.28"
+  dependencies:
+    "@floating-ui/dom": 1.6.3
+    chart.js: ^4.5.0
+    chartjs-plugin-datalabels: ^2.2.0
+    iconify-icon: 3.0.1
+    lit: 3.3.1
+  checksum: cc6d892cd08e38668b0965ab7ddfc26955b80dd759ba42a0ce8a42c37ab8b6176149b0fd58407cfce2073b359aa1dabdca5a06859bc271fd08177e0131ee1cbb
   languageName: node
   linkType: hard
 
