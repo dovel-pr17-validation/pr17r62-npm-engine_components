@@ -817,9 +817,9 @@ __metadata:
   resolution: "@thatopen/components-front@workspace:packages/front"
   dependencies:
     "@thatopen/components": ~3.6.0
-    "@thatopen/fragments": ~3.6.0
+    "@thatopen/fragments": ~3.6.1
     "@thatopen/ui": ~3.4.17
-    "@thatopen/ui-obc": ~3.4.4
+    "@thatopen/ui-obc": ~3.4.5
     "@types/convert-units": 2.3.11
     "@types/earcut": 3.0.0
     "@types/three": 0.184.0
@@ -843,7 +843,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@thatopen/components@workspace:packages/core"
   dependencies:
-    "@thatopen/fragments": ~3.6.0
+    "@thatopen/fragments": ~3.6.1
     "@thatopen/ui": ~3.4.17
     "@types/convert-units": 2.3.11
     "@types/three": 0.184.0
@@ -867,9 +867,9 @@ __metadata:
   languageName: unknown
   linkType: soft
 
-"@thatopen/fragments@npm:~3.6.0":
-  version: 3.6.0
-  resolution: "@thatopen/fragments@npm:3.6.0"
+"@thatopen/fragments@npm:~3.6.1":
+  version: 3.6.1
+  resolution: "@thatopen/fragments@npm:3.6.1"
   dependencies:
     earcut: ^3.0.1
     flatbuffers: 25.2.10
@@ -879,23 +879,23 @@ __metadata:
   peerDependencies:
     three: ">=0.182.0"
     web-ifc: ">=0.0.77"
-  checksum: dbd621c2558b304a741657697699706883601207797677625494d9a9abfbaa2f983811db084ae0504672a73c934f06f60dd96b7199e7d59e056ebb85e4ba83b5
+  checksum: e33f537ec37142fb1a9faa7a8a485a024f9a58e629358770e022d93062594be7e67169ce091eb8905cb56cb3c366d916d4da7f7e1e31efed64dd1d12a3a58367
   languageName: node
   linkType: hard
 
-"@thatopen/ui-obc@npm:~3.4.4":
-  version: 3.4.4
-  resolution: "@thatopen/ui-obc@npm:3.4.4"
+"@thatopen/ui-obc@npm:~3.4.5":
+  version: 3.4.5
+  resolution: "@thatopen/ui-obc@npm:3.4.5"
   dependencies:
     "@thatopen/ui": ~3.4.0
     lit: 3.3.1
   peerDependencies:
-    "@thatopen/components": ">=3.4.0 <3.6.0"
-    "@thatopen/components-front": ">=3.4.0 <3.6.0"
-    "@thatopen/fragments": ">=3.4.0 <3.6.0"
+    "@thatopen/components": ">=3.4.0 <3.7.0"
+    "@thatopen/components-front": ">=3.4.0 <3.7.0"
+    "@thatopen/fragments": ">=3.4.0 <3.7.0"
     three: 0.185.0
     web-ifc: ">=0.0.77"
-  checksum: 774c096c4556d1fcb87b2540f639e9ad883069b32d9c380f55886409feb9cc942d5d00e2591e23f1ccf9a42bdd34c48c6ac63807c3ab8b9f761cf6723c57c716
+  checksum: 9243c5d22c49701ec22fce6b4730d219043c47832d1ccfea907862eee23e278c33e823f1cb94c4ff5bc470a3775cf81b3a52839a5814152df24d97d8a790ed64
   languageName: node
   linkType: hard
 
