@@ -1,0 +1,85 @@
+import{B as K,o as me,L as Z,p as be,d as fe,q as ue,M as we,r as he,s as ge,t as ye,V as a,G as ve,u as xe,v as Ee,K as ke,n as J,b as g,S as Ce,w as Q,i as Se}from"./TransformControls-uP1Cexzu.js";import{TTFLoader as Le}from"./TTFLoader-Cc8uP3c-.js";import{F as Me}from"./FontLoader-7PYfSTTR.js";import{C as Pe,W as $e,S as Ae,a as Be,e as Re,F as ee}from"./index-CmPoL2JM.js";import{T as Ve}from"./index-BG6H-vHO.js";import{D as De}from"./index-BMQD3LxQ.js";import{L as Oe}from"./index-BxUbyc5-.js";import"./index-C8PHKT1s.js";import"./preload-helper-PPVm8Dsz.js";import"./index-CVvEzzpx.js";import"./ticks-DdOFWSbj.js";import"./index-B9Y5UW-c.js";import"./index-DQjo23i0.js";document.body.style.cssText="margin:0; width:100vw; height:100vh; overflow:hidden; position:relative;";const k=new Pe,Fe=k.get($e),m=Fe.create();m.scene=new Ae(k);m.scene.setup();m.scene.three.background=null;const V=document.getElementById("container");V.style.cssText="position:absolute; inset:0;";m.renderer=new Be(k,V);m.camera=new Re(k);await m.camera.controls.setLookAt(48.213,33.495,-5.062,13.117,-1.205,22.223);k.init();const ze=await ee.getWorker(),$=k.get(ee);$.init(ze);m.camera.controls.addEventListener("update",()=>$.core.update());$.list.onItemSet.add(({value:t})=>{t.useCamera(m.camera.three),m.scene.three.add(t.object),$.core.update(!0)});$.core.models.materials.list.onItemSet.add(({value:t})=>{"isLodMaterial"in t&&t.isLodMaterial||(t.polygonOffset=!0,t.polygonOffsetUnits=1,t.polygonOffsetFactor=Math.random())});const Te=await fetch("https://thatopen.github.io/engine_components/resources/frags/school_arq.frag"),_e=await Te.arrayBuffer();await $.core.load(_e,{modelId:"school_arq"});const te=k.get(Ve),i=te.create(m);i.three.position.y=11.427046;const Ue=await fetch("https://thatopen.github.io/engine_components/resources/projections/projection.json").then(t=>t.json()),oe=new K;oe.setAttribute("position",new me(new Float32Array(Ue.positions),3));i.layers.create("projection",{material:new Z({color:16711680})});const je=new be(oe);i.addProjectionLines(je,"projection");const F=i.viewports.create({left:-.996,right:16.493,top:-57.877,bottom:-64.375,scale:100}),z=i.viewports.create({left:-5.04,right:-1.434,top:.568,bottom:-5.934,scale:100});F.helperVisible=!0;z.helperVisible=!0;F.helper.resizable=!0;F.helper.movable=!0;z.helper.resizable=!0;z.helper.movable=!0;const j=40,H=16,P=20,A=document.createElement("div");A.style.cssText=`
+  position: absolute;
+  bottom: 24px;
+  left: 24px;
+  background-color: #e8e8e8;
+  background-image:
+    linear-gradient(rgba(0,0,0,0.1) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(0,0,0,0.1) 1px, transparent 1px);
+  background-size: ${j}px ${j}px;
+  border: 2px solid #888;
+  border-radius: 4px;
+  overflow: hidden;
+`;const y=document.createElement("canvas");y.style.cssText="position:absolute; top:0; left:0; display:block;";const Ie=k.get(De).exporter,Ge=(t,e)=>{const o=Ie.export([{drawing:i,viewports:[{viewport:t}]}]),n=new Blob([o],{type:"application/dxf"}),l=URL.createObjectURL(n),r=document.createElement("a");r.href=l,r.download=e,r.click(),URL.revokeObjectURL(l)},c=[];let C=null,I="",B=null;const ne=t=>{const e=c.find(o=>o.viewport===t);if(e){C=t,I=e.id;for(const o of c)o.borderEl.style.border=`1.5px solid ${o.viewport===t?"#0055ff":"#000"}`;f()}},W=(t,e)=>{const o=document.createElement("div");o.style.cssText=`
+    position: absolute;
+    box-sizing: border-box;
+    border: 1.5px solid #000;
+    cursor: pointer;
+    pointer-events: auto;
+    user-select: none;
+  `;const n=document.createElement("span");return n.textContent=t,n.style.cssText=`
+    position: absolute;
+    top: 3px; left: 4px;
+    font: 10px/1 monospace;
+    color: #000;
+    background: rgba(255,255,255,0.75);
+    padding: 1px 4px;
+    border-radius: 2px;
+    pointer-events: none;
+  `,o.appendChild(n),o.addEventListener("click",l=>{l.stopPropagation(),ne(e)}),o._tag=n,o},se=W("A",F),ie=W("B",z);c.push({id:"A",viewport:F,borderEl:se},{id:"B",viewport:z,borderEl:ie});A.append(y,se,ie);document.body.append(A);const We=`url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20'%3E%3Cline x1='10' y1='0' x2='10' y2='8' stroke='black' stroke-width='1.5'/%3E%3Cline x1='10' y1='12' x2='10' y2='20' stroke='black' stroke-width='1.5'/%3E%3Cline x1='0' y1='10' x2='8' y2='10' stroke='black' stroke-width='1.5'/%3E%3Cline x1='12' y1='10' x2='20' y2='10' stroke='black' stroke-width='1.5'/%3E%3C/svg%3E") 10 10, crosshair`,b=new fe({canvas:y,antialias:!0,alpha:!0}),re=new Map;b.autoClear=!1;function u(){const t=window.devicePixelRatio,e=c.map(({viewport:d})=>{const h=j*100/d.drawingScale;return{w:Math.round((d.right-d.left)*h),h:Math.round((d.top-d.bottom)*h)}}),o=e.reduce((d,h,v)=>d+h.w+(v>0?H:0),0)+2*P,n=Math.max(...e.map(d=>d.h))+2*P;A.style.width=`${o}px`,A.style.height=`${n}px`,b.setPixelRatio(t),b.setSize(o,n);const l=Math.round(o*t),r=Math.round(n*t),L=Math.round(P*t);b.setScissorTest(!0),b.setClearColor(0,0),b.setViewport(0,0,l,r),b.setScissor(0,0,l,r),b.clear(),b.setClearColor(16777215,1);let w=P;for(let d=0;d<c.length;d++){const{id:h,viewport:v,borderEl:x}=c[d],{w:M,h:E}=e[d],Y=Math.round(M*t),T=Math.round(E*t),q=Math.round(w*t);b.setViewport(q,r-L-T,Y,T),b.setScissor(q,r-L-T,Y,T),b.clear(),b.render(m.scene.three,v.camera),re.set(v,{x:w,y:P,w:M,h:E}),x._tag.textContent=`${h} — 1:${v.drawingScale}`,x.style.left=`${w}px`,x.style.top=`${P}px`,x.style.width=`${M}px`,x.style.height=`${E}px`,w+=M+H}b.setScissorTest(!1)}const s=te.use(Oe);s.styles.get("default").textOffset=.3;const Xe=new Le,Ye=await new Promise(t=>{Xe.load("https://thatopen.github.io/engine_components/resources/fonts/PlusJakartaSans-Medium.ttf",e=>{t(new Me(e))})});let f=()=>{};s.onCommit.add(t=>{for(const{item:e,group:o}of t){const n=s.styles.get(e.style)??s.styles.get("default"),l=`${e.pointA.distanceTo(e.pointB).toFixed(2)} m`,r=Ye.generateShapes(l,n.fontSize),L=new ue(r),w=new we(L,new he({color:n.color,side:ge}));w.rotation.x=-Math.PI/2,w.layers.set(1);const h=new ye().setFromObject(w).getCenter(new a);w.position.set(-h.x,0,-h.z);const v=new a().subVectors(e.pointB,e.pointA),x=new a(-v.z,0,v.x).normalize(),M=e.pointA.clone().add(e.pointB).multiplyScalar(.5).addScaledVector(x,e.offset),E=new ve;E.layers.set(1),E.position.copy(M).addScaledVector(x,Math.sign(e.offset)*n.textOffset).setY(.005),E.add(w),o.add(E)}u(),f()});s.onDelete.add(()=>{u(),f()});s.add(i,{pointA:new a(-3.054,0,-.347),pointB:new a(-3.054,0,5.754),offset:.6,style:"default"});s.add(i,{pointA:new a(-.378,0,61.239),pointB:new a(2.26,0,61.239),offset:.2,style:"default"});s.add(i,{pointA:new a(2.26,0,61.239),pointB:new a(5,0,61.239),offset:.2,style:"default"});s.add(i,{pointA:new a(5,0,61.239),pointB:new a(7.74,0,61.239),offset:.2,style:"default"});s.add(i,{pointA:new a(7.74,0,61.239),pointB:new a(10.48,0,61.239),offset:.2,style:"default"});s.add(i,{pointA:new a(10.48,0,61.239),pointB:new a(13.22,0,61.239),offset:.2,style:"default"});s.add(i,{pointA:new a(13.22,0,61.239),pointB:new a(15.96,0,61.239),offset:.2,style:"default"});u();const X=new K().setFromPoints([new a,new a]),p=new xe(X,new Z({color:30719,depthTest:!1}));p.layers.set(1);p.renderOrder=999;p.frustumCulled=!1;p.visible=!1;i.three.add(p);const R=new Ee,N=new Se,ae=t=>{const e=V.getBoundingClientRect();return new Q((t.clientX-e.left)/e.width*2-1,-((t.clientY-e.top)/e.height)*2+1)},O=t=>{const e=new a(0,1,0).transformDirection(i.three.matrixWorld),o=new a().setFromMatrixPosition(i.three.matrixWorld);N.setFromNormalAndCoplanarPoint(e,o);const n=new a;return t.intersectPlane(N,n),i.three.worldToLocal(n)},G=()=>c.some(t=>t.viewport.helper.isDragging);V.addEventListener("mousemove",t=>{R.setFromCamera(ae(t),m.camera.three);const e=R.ray;for(const{viewport:n}of c)n.helper.onPointerMove(e);if(G()){u();return}const o=i.raycast(e);if(o?.line){const n=X.attributes.position;n.setXYZ(0,o.line.start.x,.01,o.line.start.z),n.setXYZ(1,o.line.end.x,.01,o.line.end.z),n.needsUpdate=!0,p.visible=!0}else p.visible=!1;s.machineState.kind==="positioningOffset"&&s.sendMachineEvent({type:"MOUSE_MOVE",point:O(e)})});V.addEventListener("mouseleave",()=>{p.visible=!1});document.addEventListener("keydown",t=>{if(t.key==="Escape"){if(S){S=!1,f();return}for(const{viewport:e}of c)e.helper.onPointerUp();B&&s.machineState.kind==="awaitingFirstPoint"?ce():(s.sendMachineEvent({type:"ESCAPE"}),p.visible=!1,u())}});V.addEventListener("click",t=>{R.setFromCamera(ae(t),m.camera.three);const e=R.ray;if(G()){for(const{viewport:n}of c)n.helper.onPointerUp();u();return}for(const{viewport:n}of c)n.helper.onPointerDown(e);if(G())return;if(S){qe(O(e)),S=!1,f();return}const o=i.raycast(e);if(s.machineState.kind==="awaitingFirstPoint"&&o?.line){s.sendMachineEvent({type:"SELECT_LINE",line:o.line,drawing:i});return}s.machineState.kind==="positioningOffset"&&s.sendMachineEvent({type:"CLICK",point:O(e),drawing:i})});const le=(t,e)=>{for(const o of c)o.borderEl.style.pointerEvents="auto";ne(t),B=t,e.style.pointerEvents="none",e.style.border="1.5px dashed #0055ff",y.style.cursor=We,f()},ce=()=>{if(B){B=null;for(const t of c)t.borderEl.style.pointerEvents="auto",t.borderEl.style.border=`1.5px solid ${t.viewport===C?"#0055ff":"#000"}`;y.style.cursor="",p.visible=!1,u(),f()}},de=()=>{B&&(s.sendMachineEvent({type:"ESCAPE"}),p.visible=!1,ce())};for(const{viewport:t,borderEl:e}of c)e.addEventListener("dblclick",o=>{o.stopPropagation(),le(t,e)}),e.addEventListener("click",de);let S=!1,_=c.length;const qe=t=>{const o=i.viewports.create({left:t.x-2.5,right:t.x+2.5,top:-t.z+2.5,bottom:-t.z-2.5,scale:100});o.helperVisible=!0,o.helper.resizable=!0,o.helper.movable=!0;const n=String.fromCharCode(65+_%26)+(_>=26?String(Math.floor(_/26)):"");_++;const l=W(n,o);A.appendChild(l);const r={id:n,viewport:o,borderEl:l};c.push(r),l.addEventListener("dblclick",L=>{L.stopPropagation(),le(o,l)}),l.addEventListener("click",de),u()},pe=t=>{const e=y.getBoundingClientRect(),o=t.clientX-e.left,n=t.clientY-e.top;for(const{viewport:l}of c){const r=re.get(l);if(!(!r||o<r.x||o>r.x+r.w||n<r.y||n>r.y+r.h))return R.setFromCamera(new Q((o-r.x)/r.w*2-1,-((n-r.y)/r.h)*2+1),l.camera),{ray:R.ray,viewport:l}}return null};y.addEventListener("mousemove",t=>{const e=pe(t);if(!e){p.visible=!1;return}const o=i.raycast(e.ray,e.viewport);if(o?.line){const n=X.attributes.position;n.setXYZ(0,o.line.start.x,.01,o.line.start.z),n.setXYZ(1,o.line.end.x,.01,o.line.end.z),n.needsUpdate=!0,p.visible=!0}else p.visible=!1;s.machineState.kind==="positioningOffset"&&s.sendMachineEvent({type:"MOUSE_MOVE",point:O(e.ray)}),u()});y.addEventListener("mouseleave",()=>{p.visible=!1});y.addEventListener("click",t=>{const e=pe(t);if(!e)return;const o=i.raycast(e.ray,e.viewport);if(s.machineState.kind==="awaitingFirstPoint"&&o?.line){s.sendMachineEvent({type:"SELECT_LINE",line:o.line,drawing:i});return}s.machineState.kind==="positioningOffset"&&s.sendMachineEvent({type:"CLICK",point:O(e.ray),drawing:i})});ke.init();const[U,He]=J.create(t=>g`
+    <bim-panel active label="Multiple Viewports" class="options-menu" style="max-width: 20rem;">
+
+      <bim-panel-section label="Viewports">
+        ${S?g`
+          <bim-label style="white-space: normal;">Click anywhere on the drawing to place a 5 m viewport. Press Esc to cancel.</bim-label>
+          <bim-button label="Cancel"
+            @click=${()=>{S=!1,f()}}>
+          </bim-button>
+        `:g`
+          <bim-button label="Add Viewport"
+            @click=${()=>{S=!0,f()}}>
+          </bim-button>
+        `}
+      </bim-panel-section>
+
+      <bim-panel-section label="Linear Dimensions">
+        ${B?g`
+          <bim-label style="white-space: normal;">Hover a projection line and click to anchor the first point, then click to set the offset. Press Esc to cancel a dimension in progress, or Esc again to exit edit mode.</bim-label>
+        `:g`
+          <bim-label style="white-space: normal;">Double-click a viewport to enter edit mode and start placing dimensions.</bim-label>
+        `}
+        <bim-label style="white-space: normal;">Committed: ${s.get([i]).size}</bim-label>
+        <bim-button label="Clear all"
+          @click=${()=>{s.clear([i]),u(),f()}}>
+        </bim-button>
+      </bim-panel-section>
+
+      <bim-panel-section label="Viewport">
+        ${C?g`
+          <bim-label style="white-space: normal;">Click: select · Double-click: edit mode</bim-label>
+          <bim-label style="white-space: normal;">Viewport ${I} — 1:${C.drawingScale}</bim-label>
+          <bim-dropdown
+            label="Scale"
+            @change=${e=>{const o=e.target.value;o.length&&(C.drawingScale=parseInt(o[0],10),u(),f())}}>
+            ${[50,100,200].map(e=>g`
+              <bim-option
+                label="1:${e}"
+                value="${e}"
+                ?checked=${e===C.drawingScale}>
+              </bim-option>
+            `)}
+          </bim-dropdown>
+          <bim-button label="Export DXF"
+            @click=${()=>Ge(C,`viewport-${I.toLowerCase()}.dxf`)}>
+          </bim-button>
+        `:g`
+          <bim-label style="white-space: normal;">Click a viewport to select it · Double-click to edit</bim-label>
+        `}
+      </bim-panel-section>
+
+    </bim-panel>
+  `,{});f=He;document.body.append(U);const Ne=J.create(()=>g`
+  <bim-button class="phone-menu-toggler" icon="solar:settings-bold"
+    @click="${()=>{U.classList.contains("options-menu-visible")?U.classList.remove("options-menu-visible"):U.classList.add("options-menu-visible")}}">
+  </bim-button>
+`);document.body.append(Ne);const D=new Ce;D.showPanel(2);document.body.append(D.dom);D.dom.style.left="0px";D.dom.style.zIndex="unset";m.renderer.onBeforeUpdate.add(()=>D.begin());m.renderer.onAfterUpdate.add(()=>D.end());

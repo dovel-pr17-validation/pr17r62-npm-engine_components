@@ -1,0 +1,1438 @@
+import * as THREE from "three";
+import { FragmentsManager } from "../../../fragments/FragmentsManager";
+import type { Components } from "../../Components";
+import { Mouse } from "../../Raycasters/src/mouse";
+import type { BaseRenderer } from "../../Types/src/base-renderer";
+import { Component } from "../../Types/src/component";
+import { Event } from "../../Types/src/event";
+import type { Disposable } from "../../Types/src/interfaces";
+import type { World } from "../../Types/src/world";
+import {
+  newDepthNodeMaterial,
+  newIdNodeMaterial,
+  newNormalNodeMaterial,
+} from "./picker-node-materials";
+
+/**
+ * Attachment index of each pick output in the pick render target. Matches
+ * the `layout(location)` of that output in
+ * {@link FastModelPicker.buildPickMaterial}. Adding an output takes a key
+ * here, an `out` in the shader and a decoder below; WebGL2 guarantees at
+ * least 4 draw buffers.
+ */
+const PickOutput = { id: 0, depth: 1, normal: 2 } as const;
+
+type PickOutputName = keyof typeof PickOutput;
+
+const PICK_OUTPUT_NAMES = Object.keys(PickOutput) as PickOutputName[];
+
+/** The outputs {@link FastModelPicker.renderPick} reads back. */
+type PickRequest = Readonly<Partial<Record<PickOutputName, boolean>>>;
+
+/** One RGBA pixel per output, filled by {@link FastModelPicker.renderPick}. */
+type PickBuffers = Readonly<Record<PickOutputName, Uint8Array>>;
+
+/**
+ * A decoded pick. Every value is owned by the result: no reference into the
+ * picker's reused pixel buffers, camera snapshot or byte map.
+ * {@link FastModelPicker.pick} is synchronous and decodes before it returns,
+ * so a caller can await anything it likes afterwards — a `localId`
+ * translation, say — without the result drifting under it.
+ */
+interface Pick {
+  /** The item under the cursor, when the `id` output was requested. */
+  item: { modelId: string; itemId: number } | null;
+  /**
+   * The surface under the cursor, when the `depth` output was requested.
+   * `distance` is measured from the camera the pick was rendered with.
+   */
+  surface: { point: THREE.Vector3; distance: number } | null;
+  /** The surface normal, when the `normal` output was requested. */
+  normal: THREE.Vector3 | null;
+}
+
+/** What {@link FastModelPicker.renderPick} hands to the decoders. */
+interface PickFrame {
+  /** The byte each model was drawn with. */
+  byteToModel: ReadonlyMap<number, string>;
+  /**
+   * The camera the pick was rendered with, a snapshot of the world camera.
+   * Decode against it rather than `world.camera`, which may have moved on.
+   * Reused by the next pick, so decode before awaiting anything.
+   */
+  camera: THREE.Camera;
+  /** Center of the read pixel, in {@link camera}'s NDC. */
+  ndc: THREE.Vector2;
+  /**
+   * Whether the renderer draws with a reversed depth buffer
+   * (`reversedDepthBuffer: true` and `EXT_clip_control` available). Then
+   * depth runs 1 at the near plane to 0 at the far plane and already is the
+   * NDC z, instead of `ndc.z * 0.5 + 0.5`.
+   */
+  reversedDepth: boolean;
+  /**
+   * Whether the depth sample already is the NDC z in `[0, 1]`: with a
+   * reversed depth buffer, and always under WebGPU, whose clip space is
+   * `[0, 1]` by construction. Otherwise it is expanded from `[-1, 1]`.
+   */
+  unitDepth: boolean;
+}
+
+const ID_REQUEST: PickRequest = { id: true };
+const DEPTH_REQUEST: PickRequest = { depth: true };
+const NORMAL_REQUEST: PickRequest = { normal: true };
+const FULL_REQUEST: PickRequest = { id: true, depth: true, normal: true };
+const NO_REQUEST: PickRequest = {};
+
+/** The viewport center, which the debug overlay renders around. Never written. */
+const ORIGIN = new THREE.Vector2();
+
+/**
+ * The depth packing of the pick shader's `depth` output, as a GLSL snippet:
+ * given `gl_FragCoord.z` in scope it declares `vec4 packedDepth`. Byte for
+ * byte the same expression as `outDepth` in
+ * {@link FastModelPicker.buildPickMaterial}, so {@link unpackDepthFromRGBA}
+ * decodes both. Exposed as {@link FastModelPicker.depthPackBody} for
+ * {@link FastModelPicker.pickDepthContributors}.
+ */
+const DEPTH_PACK_BODY = /* glsl */ `
+  float packDepthValue = gl_FragCoord.z;
+  vec4 packedDepth = vec4(
+    fract(packDepthValue * 16777216.0),
+    fract(packDepthValue * 65536.0),
+    fract(packDepthValue * 256.0),
+    packDepthValue
+  );
+  packedDepth.yzw -= packedDepth.xyz * (1.0 / 256.0);
+  packedDepth *= (256.0 / 255.0);
+`;
+
+/**
+ * Context handed to each {@link FastModelPicker.pickDepthContributors} entry.
+ * `target` is bound and scissored to the pixel under the cursor when the
+ * contributor runs; `camera` is the world camera (not narrowed).
+ */
+export interface PickDepthContributorContext {
+  renderer: THREE.WebGLRenderer;
+  camera: THREE.Camera;
+  target: THREE.WebGLRenderTarget;
+  /** Scissor box in CSS pixels (as `renderer.setScissor` takes it). */
+  scissor: THREE.Vector4;
+}
+
+/** A depth-only geometry source for {@link FastModelPicker.getPointAt}. */
+export type PickDepthContributor = (ctx: PickDepthContributorContext) => void;
+
+/**
+ * The camera every pick renders through. Its matrices are written by
+ * `snapshotCamera` before each render, so it has nothing to recompute.
+ *
+ * With a reversed depth buffer, three calls `updateProjectionMatrix()` on
+ * the first render through a camera that is not yet flagged as reversed.
+ * A bare `THREE.Camera` has no such method, so the first pick threw. A
+ * `PerspectiveCamera` or `OrthographicCamera` would not throw, but it would
+ * rebuild the projection from its own fov / frustum and overwrite the
+ * narrowed pick projection, so that first pick would read the wrong pixel.
+ * The copied projection is the world camera's, which three has already
+ * switched to reversed depth when it rendered the scene, so keeping the
+ * written matrix is the correct answer.
+ */
+class PickCamera extends THREE.Camera {
+  updateProjectionMatrix() {
+    // Intentionally empty: the projection is copied, never derived.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Render target / scene helpers
+// ---------------------------------------------------------------------------
+
+/** A render target with one RGBA8 attachment per {@link PickOutput}. */
+function createPickTarget(width: number, height: number) {
+  return new THREE.WebGLRenderTarget(width, height, {
+    count: PICK_OUTPUT_NAMES.length,
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    depthBuffer: true,
+  });
+}
+
+/** WebGPU only: a 1×1 RGBA8 target for one pick output. */
+function createGpuPickTarget() {
+  return new THREE.WebGLRenderTarget(1, 1, {
+    format: THREE.RGBAFormat,
+    type: THREE.UnsignedByteType,
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    depthBuffer: true,
+  });
+}
+
+/** Whether three draws `object` itself, as opposed to only its children. */
+function isRenderable(object: THREE.Object3D) {
+  const flags = object as Partial<
+    Record<"isMesh" | "isLine" | "isPoints" | "isSprite", boolean>
+  >;
+  return Boolean(
+    flags.isMesh || flags.isLine || flags.isPoints || flags.isSprite,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Decoders
+// ---------------------------------------------------------------------------
+
+/**
+ * Inverse of the depth packing in {@link FastModelPicker.buildPickMaterial}.
+ * The shader pre-multiplies its packed bytes by `256/255` (so `depth = 1.0`
+ * round-trips to `(255, 255, 255, 255)`); we mirror that with `255/256`
+ * here.
+ */
+function unpackDepthFromRGBA(pixels: Uint8Array): number {
+  const r = pixels[0] / 255;
+  const g = pixels[1] / 255;
+  const b = pixels[2] / 255;
+  const a = pixels[3] / 255;
+  const downscale = 255 / 256;
+  return downscale * (r / (256 * 256 * 256) + g / (256 * 256) + b / 256 + a);
+}
+
+/**
+ * Convert a cursor `ndc` and a `[0..1]` depth-buffer sample to a
+ * world-space point, through the camera's matrices.
+ *
+ * With a standard depth buffer NDC z lives in `[-1..1]`, so the sample is
+ * expanded. With a reversed one three sets clip control to a `[0..1]` depth
+ * range and builds the projection reversed, so the sample IS the NDC z;
+ * expanding it would put every point just past the near plane.
+ */
+function unprojectToWorld(
+  ndc: THREE.Vector2,
+  depth: number,
+  camera: THREE.Camera,
+  reversedDepth: boolean,
+): THREE.Vector3 {
+  const z = reversedDepth ? depth : depth * 2 - 1;
+  const v = new THREE.Vector3(ndc.x, ndc.y, z);
+  v.unproject(camera);
+  return v;
+}
+
+/**
+ * Decodes the {@link PickOutput.id} pixel into the picked item, or `null`
+ * over empty space.
+ */
+function decodeId(pixel: Uint8Array, byteToModel: ReadonlyMap<number, string>) {
+  // Byte 0 is the cleared / void value and is never assigned to a model.
+  const modelId = byteToModel.get(pixel[0]);
+  if (!modelId) return null;
+  // The shader keeps the lower three bytes of `itemId + 1`; 0 means no item.
+  // eslint-disable-next-line no-bitwise
+  const encoded = (pixel[1] << 16) | (pixel[2] << 8) | pixel[3];
+  if (encoded === 0) return null;
+  return { modelId, itemId: encoded - 1 };
+}
+
+/**
+ * WebGPU readback: `readRenderTargetPixelsAsync` RETURNS the pixels (its 6th
+ * argument is a texture index, not an output buffer, unlike WebGL's). A
+ * failed read (the first frames, before the pipelines exist) reads as void.
+ */
+async function readWebGPUPixel(
+  renderer: THREE.WebGLRenderer,
+  target: THREE.WebGLRenderTarget,
+  out: Uint8Array,
+) {
+  try {
+    const data = await (renderer as any).readRenderTargetPixelsAsync(
+      target,
+      0,
+      0,
+      1,
+      1,
+    );
+    const bytes =
+      data instanceof Uint8Array ? data : new Uint8Array(data.buffer ?? data);
+    out.set(bytes.subarray(0, out.length));
+  } catch {
+    out.fill(0);
+  }
+}
+
+/**
+ * Decodes the {@link PickOutput.depth} pixel into the world-space point it
+ * describes, or `null` over empty space.
+ */
+function decodePoint(pixel: Uint8Array, frame: PickFrame) {
+  if (pixel[0] === 0 && pixel[1] === 0 && pixel[2] === 0 && pixel[3] === 0) {
+    return null; // cleared / void — nothing was drawn here
+  }
+  const depth = unpackDepthFromRGBA(pixel);
+  // The far plane (depth ≈ 1, or ≈ 0 when reversed) means nothing in front
+  // of the camera at that pixel. Treat as void rather than returning a
+  // point on the far plane.
+  const { reversedDepth } = frame;
+  if (reversedDepth ? depth <= 1e-6 : depth >= 1.0 - 1e-6) return null;
+  return unprojectToWorld(frame.ndc, depth, frame.camera, frame.unitDepth);
+}
+
+/**
+ * Decodes the {@link PickOutput.normal} pixel into a unit world-space
+ * normal, or `null` over empty space.
+ */
+function decodeNormal(pixel: Uint8Array) {
+  if (pixel[3] === 0) return null; // void pixel — nothing rendered here
+  // No zero-length guard: the shader writes a unit normal, and byte
+  // quantization can't land all three channels within 1/255 of the origin,
+  // so the shortest vector this can decode is still well clear of zero.
+  return new THREE.Vector3(
+    (pixel[0] / 255) * 2 - 1,
+    (pixel[1] / 255) * 2 - 1,
+    (pixel[2] / 255) * 2 - 1,
+  ).normalize();
+}
+
+async function itemIdToLocalId(
+  fragments: FragmentsManager,
+  modelId: string,
+  itemId: number,
+) {
+  const model = fragments.list.get(modelId);
+  if (!model) return null;
+  const localIds = await model.getLocalIdsFromItemIds([itemId]);
+  const localId = localIds?.[0];
+  return localId ?? null;
+}
+
+/**
+ * GPU-readback picker that identifies what's under a screen position
+ * without going through the worker raycast.
+ *
+ * - {@link getModelAt} returns the model id under the cursor.
+ * - {@link getItemAt} returns the item itself (`modelId` + `localId`).
+ * - {@link getPointAt} / {@link getNormalAt} return the surface point and normal.
+ * - {@link getFullPick} returns all of the above from the same pick.
+ *
+ * Every query goes through {@link renderPick}: one render of the BIM scene
+ * into a 1×1 multiple-render-target, through a camera whose frustum covers
+ * only the pixel under the cursor. The pick shader writes the item id,
+ * depth and normal of that pixel into one attachment each, so they always
+ * describe the same fragment; each query reads back only the attachments
+ * it needs.
+ *
+ * What can be picked is what is drawn. An item that fragments currently draws
+ * at a reduced LOD — a line mesh carrying no `id` attribute — is not pickable,
+ * and the pick resolves to whatever is behind it; the worker raycast tests the
+ * authored geometry instead, so the two can disagree on small or distant
+ * items, see {@link collectPickables}.
+ *
+ * Item id encoding (one pixel). The id is written as `itemId + 1` so that
+ * an unwritten pixel (all zeroes) decodes as "no item" rather than item 0:
+ *   R = modelByte (1..254, 0 = void / unwritten)
+ *   G = ((itemId + 1) >> 16) & 0xff
+ *   B = ((itemId + 1) >> 8)  & 0xff
+ *   A = (itemId + 1)         & 0xff
+ *
+ * `modelByte` is assigned per-pick, so the assignment is stable for the
+ * duration of the pick but doesn't grow over the session.
+ */
+export class FastModelPicker implements Disposable {
+  /** {@link Component.enabled} */
+  enabled = true;
+
+  /** Components instance this picker belongs to. */
+  components: Components;
+
+  /** {@link Disposable.onDisposed} */
+  readonly onDisposed = new Event();
+
+  /** Position helper bound to the world's canvas. */
+  readonly mouse: Mouse;
+
+  /** World this picker renders against. */
+  world: World;
+
+  /**
+   * When `true`, mirrors the id output of the whole viewport to a debug
+   * canvas pinned in the top-right corner. Each model shows up as a
+   * near-uniform red band (the model byte) modulated by varying greens /
+   * blues from the per-item id encoding.
+   */
+  debugMode = false;
+
+  /**
+   * Just the depth packing expression (no `main`, no clipping, no output
+   * write): given `gl_FragCoord.z` in scope it declares `vec4 packedDepth`,
+   * packed exactly like the picker's own depth output. Contributors splice it
+   * into their own fragment shader (after any `discard` logic of their own)
+   * and write `packedDepth` to their output.
+   */
+  readonly depthPackBody = DEPTH_PACK_BODY;
+
+  /**
+   * Depth-only contributors (point clouds, splats: geometry that is not a
+   * fragments model). When a pick asks for depth ({@link getPointAt},
+   * {@link getFullPick}), each contributor re-renders its geometry with a
+   * {@link depthPackBody} material into a separate single-attachment target
+   * (bound, cleared and scissored to the pixel under the cursor, depth shared
+   * between contributors so the nearest wins). The picker then keeps whichever
+   * is nearer to the camera: the BIM surface or the contributor surface. When
+   * a contributor wins, the normal is `null` (contributors write no normal).
+   *
+   * Contributors carry no item ids, so {@link getItemAt} / {@link getModelAt}
+   * are untouched. A contributor must leave renderer state as it found it
+   * (the picker restores target / scissor / clear colour afterwards).
+   *
+   * WebGL only for now: under a WebGPU renderer contributors are skipped (the
+   * pack body is GLSL).
+   */
+  readonly pickDepthContributors = new Set<PickDepthContributor>();
+
+  /**
+   * Maximum models the picker can disambiguate in a single pick. Capped
+   * by the 8-bit `modelByte`. In practice we never approach this.
+   */
+  static readonly MAX_MODELS = 254;
+
+  /** The 1×1 target every pick renders into. */
+  private _pickTarget?: THREE.WebGLRenderTarget = createPickTarget(1, 1);
+
+  /** Viewport-sized target for the debug overlay, created on demand. */
+  private _debugTarget?: THREE.WebGLRenderTarget;
+
+  /** Drawing-buffer-sized target for {@link pickDepthContributors}, created on demand. */
+  private _contributorTarget?: THREE.WebGLRenderTarget;
+  private _contributorPixel = new Uint8Array(4);
+  private _contributorSize = new THREE.Vector2();
+  private _contributorScissor = new THREE.Vector4();
+  private _contributorNdc = new THREE.Vector2();
+
+  private _pickBuffers: PickBuffers = {
+    id: new Uint8Array(4),
+    depth: new Uint8Array(4),
+    normal: new Uint8Array(4),
+  };
+
+  private _debugCanvas?: HTMLCanvasElement;
+  private _debugContainer?: HTMLDivElement;
+
+  /**
+   * Writes every {@link PickOutput} on each draw. Set as the scene's
+   * `overrideMaterial` for the pick render, so fragments' materials are
+   * never swapped.
+   */
+  private _pickMaterial: THREE.ShaderMaterial;
+
+  /** Snapshot of the world camera with a narrowed projection. */
+  private _pickCamera = new PickCamera();
+  private _pickMatrix = new THREE.Matrix4();
+  private _pickNdc = new THREE.Vector2();
+  private _viewportSize = new THREE.Vector2();
+  private _clearColor = new THREE.Color();
+  /** The pick camera's world position, for measuring distance to a hit. */
+  private _cameraPosition = new THREE.Vector3();
+
+  /**
+   * Per-pick state filled by {@link collectPickables}. `_meshBytes` is read
+   * by the pick material while drawing; `_byteToModel` outlives the render
+   * so the caller can decode the id output.
+   */
+  private _meshBytes = new Map<THREE.Object3D, number>();
+  private _byteToModel = new Map<number, string>();
+  private _modelBytes = new Map<string, number>();
+  private _modelRoots = new Map<THREE.Object3D, string>();
+
+  /** Undo log for {@link collectPickables}, drained by {@link restorePickables}. */
+  private _hidden: THREE.Object3D[] = [];
+  private _forcedOverrides: THREE.Material[] = [];
+
+  private _walkNodes: THREE.Object3D[] = [];
+  private _walkOwners: (string | null)[] = [];
+
+  /** The pick material's `clippingPlanes`, refilled by {@link collectLocalPlanes}. */
+  private _localPlanes: THREE.Plane[] = [];
+
+  /**
+   * WebGPU only: one TSL node material per {@link PickOutput} (the GLSL MRT
+   * shader cannot compile there), built on the first WebGPU pick.
+   */
+  private _gpuMaterials?: Record<PickOutputName, THREE.ShaderMaterial>;
+
+  /** WebGPU only: one 1×1 single-attachment target per output. */
+  private _gpuTargets?: Record<PickOutputName, THREE.WebGLRenderTarget>;
+
+  constructor(components: Components, world: World) {
+    if (!world.renderer) {
+      throw new Error("A renderer is needed for the FastModelPicker to work!");
+    }
+    this.world = world;
+    this.mouse = new Mouse(world.renderer.three.domElement);
+    this.components = components;
+    this._pickMaterial = this.buildPickMaterial();
+    // The matrices are copied from the world camera on every pick; keep
+    // `render()` from recomputing them out of the unused local transform.
+    this._pickCamera.matrixAutoUpdate = false;
+    this._pickCamera.matrixWorldAutoUpdate = false;
+  }
+
+  /**
+   * Returns the model id under the given screen position, or `null` if
+   * the cursor is over empty space.
+   *
+   * Cheaper than {@link getItemAt} because we don't resolve the
+   * `localId`; we just read the model byte.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   */
+  async getModelAt(position?: THREE.Vector2): Promise<string | null> {
+    return (await this.pickAny(position, ID_REQUEST))?.item?.modelId ?? null;
+  }
+
+  /**
+   * Returns `{ modelId, localId }` for the item under the given screen
+   * position, or `null` if the cursor is over empty space.
+   *
+   * The vertex `id` attribute encodes the internal **itemId** (the
+   * FlatBuffer `sample.item()` index, key for `boxes.sampleOf`) rather
+   * than the user-facing localId, which unblocks the snap path's O(1)
+   * sample lookup. The trade-off: resolving `localId` takes one worker
+   * round-trip. Internal consumers that only need itemId (e.g. snap) can
+   * read it from the result directly.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   */
+  async getItemAt(
+    position?: THREE.Vector2,
+  ): Promise<{ modelId: string; localId: number; itemId: number } | null> {
+    const item = (await this.pickAny(position, ID_REQUEST))?.item;
+    if (!item) return null;
+    const fragments = this.components.get(FragmentsManager);
+    const localId = await itemIdToLocalId(fragments, item.modelId, item.itemId);
+    if (localId === undefined || localId === null) return null;
+    return { modelId: item.modelId, localId, itemId: item.itemId };
+  }
+
+  /**
+   * Returns the world-space point under the given screen position, or
+   * `null` if the cursor is over empty space.
+   *
+   * Reads the packed `gl_FragCoord.z` of the picked pixel and unprojects
+   * it through the pick camera. Useful for things like "set camera orbit
+   * center to what the user just clicked on".
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   */
+  async getPointAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
+    return (await this.pickAny(position, DEPTH_REQUEST))?.surface?.point ?? null;
+  }
+
+  /**
+   * Returns the world-space surface normal under the cursor, or `null`
+   * if the cursor is over empty space.
+   *
+   * @param position - Normalized device coords. Defaults to the
+   *   picker's last known mouse position.
+   */
+  async getNormalAt(position?: THREE.Vector2): Promise<THREE.Vector3 | null> {
+    return (await this.pickAny(position, NORMAL_REQUEST))?.normal ?? null;
+  }
+
+  /**
+   * One-shot pick that produces the full result shape consumers need:
+   * `{ modelId, localId, point, normal, distance }`, all from the same
+   * render.
+   *
+   * Returns `null` if the cursor is over empty space, the id output
+   * decodes to the void sentinel, or the depth round-trip yields the
+   * far plane.
+   */
+  async getFullPick(position?: THREE.Vector2): Promise<{
+    modelId: string;
+    localId: number;
+    /**
+     * Internal item index (FlatBuffer `sample.item()`). Exposed so
+     * SnapResolver and other internal consumers can hit fragments'
+     * itemId-keyed fast paths (`boxes.sampleOf`) without paying a
+     * second worker round-trip to translate back from localId.
+     */
+    itemId: number;
+    point: THREE.Vector3;
+    normal: THREE.Vector3 | null;
+    distance: number;
+  } | null> {
+    // `pick` is synchronous and hands back values it owns, so the `localId`
+    // round-trip below cannot drift the point, normal or distance.
+    const pick = await this.pickAny(position, FULL_REQUEST);
+    if (!pick?.item || !pick.surface) return null;
+
+    const fragments = this.components.get(FragmentsManager);
+    const { modelId, itemId } = pick.item;
+    const localId = await itemIdToLocalId(fragments, modelId, itemId);
+
+    if (localId === undefined || localId === null) return null;
+    return {
+      modelId,
+      itemId,
+      localId,
+      point: pick.surface.point,
+      normal: pick.normal,
+      distance: pick.surface.distance,
+    };
+  }
+
+  /**
+   * Toggle the debug overlay. When enabled the picker mirrors the id
+   * output of the whole viewport to a small canvas pinned in the
+   * top-right corner so you can see what the picks see.
+   */
+  setDebugMode(enabled: boolean) {
+    this.debugMode = enabled;
+    if (enabled) this.setupDebugCanvas();
+    else this.removeDebugCanvas();
+  }
+
+  /** {@link Disposable.dispose} */
+  dispose() {
+    this.mouse.dispose();
+    this.removeDebugCanvas();
+    this._pickMaterial.dispose();
+    this._pickTarget?.dispose();
+    this._pickTarget = undefined;
+    this._debugTarget?.dispose();
+    this._debugTarget = undefined;
+    for (const name of PICK_OUTPUT_NAMES) {
+      this._gpuMaterials?.[name].dispose();
+      this._gpuTargets?.[name].dispose();
+    }
+    this._gpuMaterials = undefined;
+    this._gpuTargets = undefined;
+    this._contributorTarget?.dispose();
+    this._contributorTarget = undefined;
+    this.pickDepthContributors.clear();
+    this.onDisposed.trigger();
+    this.onDisposed.reset();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Pick path
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renders one pick and decodes the outputs named in `request` into values
+   * the caller owns. Synchronous by design: everything that depends on the
+   * picker's reused state is resolved here, so nothing an entry point does
+   * afterwards can race the next pick.
+   */
+  private pick(
+    position: THREE.Vector2 | undefined,
+    request: PickRequest,
+  ): Pick | null {
+    if (!this._pickTarget) return null;
+    if (this.debugMode) this.updateDebugCanvas();
+    const ndc = position ?? this.mouse.position;
+    const buffers = this._pickBuffers;
+    const frame = this.renderPick(ndc, request, this._pickTarget, buffers);
+    const contributed = request.depth ? this.pickContributors(ndc) : null;
+    if (!frame && !contributed) return null;
+
+    return this.decodePick(request, buffers, frame, contributed);
+  }
+
+  /**
+   * Decodes the outputs named in `request` into values the caller owns. A
+   * point from a depth contributor (point cloud, splat) wins when nearer.
+   */
+  private decodePick(
+    request: PickRequest,
+    buffers: PickBuffers,
+    frame: PickFrame | null,
+    contributed: THREE.Vector3 | null = null,
+  ): Pick {
+    let point =
+      frame && request.depth ? decodePoint(buffers.depth, frame) : null;
+    let normal =
+      frame && request.normal ? decodeNormal(buffers.normal) : null;
+    const eye = this._cameraPosition.setFromMatrixPosition(
+      frame ? frame.camera.matrixWorld : this.world.camera.three.matrixWorld,
+    );
+    if (
+      contributed &&
+      (!point || contributed.distanceTo(eye) < point.distanceTo(eye))
+    ) {
+      point = contributed;
+      normal = null;
+    }
+    return {
+      item:
+        frame && request.id ? decodeId(buffers.id, frame.byteToModel) : null,
+      surface: point ? { point, distance: point.distanceTo(eye) } : null,
+      normal,
+    };
+  }
+
+  /** Whether the world draws with a WebGPU renderer (SimpleRenderer's `mode: "webgpu"`). */
+  private isWebGPU() {
+    const three = this.world.renderer?.three as
+      | { isWebGPURenderer?: boolean }
+      | undefined;
+    return three?.isWebGPURenderer === true;
+  }
+
+  /**
+   * {@link pick} on either renderer. WebGL is synchronous, as always.
+   * WebGPU has no synchronous readback, so there the pick resolves a frame
+   * or so later, decoded against a snapshot of the pick state it owns.
+   */
+  private pickAny(
+    position: THREE.Vector2 | undefined,
+    request: PickRequest,
+  ): Pick | null | Promise<Pick | null> {
+    if (this.isWebGPU()) return this.pickWebGPU(position, request);
+    return this.pick(position, request);
+  }
+
+  /**
+   * WebGPU only: renders each requested output into its own 1×1 target with
+   * its TSL material (the id output once per model, the model byte being a
+   * uniform), queues the readbacks right after each render, and decodes
+   * once they land. Everything the decode needs (camera, byte map, pixels)
+   * is copied first, so a pick that starts meanwhile cannot disturb it.
+   */
+  private async pickWebGPU(
+    position: THREE.Vector2 | undefined,
+    request: PickRequest,
+  ): Promise<Pick | null> {
+    if (!this._pickTarget) return null;
+    const ndc = (position ?? this.mouse.position).clone();
+    const rendered = this.renderPickWebGPU(ndc, request);
+    if (!rendered) return null;
+    await Promise.all(rendered.reads);
+    return this.decodePick(request, rendered.buffers, rendered.frame);
+  }
+
+  private renderPickWebGPU(ndc: THREE.Vector2, request: PickRequest) {
+    if (!this.enabled || !this.world.renderer) return null;
+    const scene = this.world.scene.three as THREE.Scene;
+    if (!scene.isScene) return null;
+    const fragments = this.components.get(FragmentsManager);
+    if (!fragments.initialized || fragments.list.size === 0) return null;
+
+    const renderer = this.world.renderer.three;
+    const viewport = renderer.getSize(this._viewportSize);
+    if (viewport.x === 0 || viewport.y === 0) return null;
+
+    const materials = (this._gpuMaterials ??= {
+      id: newIdNodeMaterial(),
+      depth: newDepthNodeMaterial(),
+      normal: newNormalNodeMaterial(),
+    });
+    const targets = (this._gpuTargets ??= {
+      id: createGpuPickTarget(),
+      depth: createGpuPickTarget(),
+      normal: createGpuPickTarget(),
+    });
+
+    const camera = this.snapshotCamera(ndc, viewport, targets.id);
+    // The world camera's projection is already built for WebGPU's clip space;
+    // matching its coordinate system keeps three from rebuilding ours.
+    (camera as any).coordinateSystem = (
+      this.world.camera.three as any
+    ).coordinateSystem;
+
+    const buffers: PickBuffers = {
+      id: new Uint8Array(4),
+      depth: new Uint8Array(4),
+      normal: new Uint8Array(4),
+    };
+    const reads: Promise<void>[] = [];
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    const prevClearColor = renderer.getClearColor(this._clearColor);
+    const prevClearAlpha = renderer.getClearAlpha();
+    const prevBackground = scene.background;
+    const prevOverrideMaterial = scene.overrideMaterial;
+    const shadowMap = renderer.shadowMap as any;
+    const prevShadowAutoUpdate = shadowMap?.autoUpdate;
+    const prevShadowNeedsUpdate = shadowMap?.needsUpdate;
+    const byByte = new Map<number, THREE.Object3D[]>();
+    let byteToModel: Map<number, string> | null = null;
+
+    try {
+      this.collectPickables(scene, fragments);
+      if (this._byteToModel.size === 0) return null;
+      byteToModel = new Map(this._byteToModel);
+      for (const [node, byte] of this._meshBytes) {
+        let nodes = byByte.get(byte);
+        if (!nodes) {
+          nodes = [];
+          byByte.set(byte, nodes);
+        }
+        nodes.push(node);
+      }
+
+      // See `renderPick` for why each of these is set.
+      scene.background = null;
+      if (shadowMap) {
+        shadowMap.autoUpdate = false;
+        shadowMap.needsUpdate = false;
+      }
+      renderer.setClearColor(0x000000, 0);
+      renderer.autoClear = false;
+
+      for (const name of PICK_OUTPUT_NAMES) {
+        if (!request[name]) continue;
+        const material = materials[name];
+        const target = targets[name];
+        scene.overrideMaterial = material;
+        renderer.setRenderTarget(target);
+        renderer.clear(true, true, false);
+        if (name === "id") {
+          // One render per model, the byte flipped between them; the depth
+          // buffer is shared, so the front-most item wins across models.
+          for (const [byte, nodes] of byByte) {
+            for (const [other, others] of byByte) {
+              for (const node of others) node.visible = other === byte;
+            }
+            for (const node of nodes) node.visible = true;
+            material.uniforms.modelByte.value = byte;
+            renderer.render(scene, camera);
+          }
+          for (const nodes of byByte.values()) {
+            for (const node of nodes) node.visible = true;
+          }
+        } else {
+          renderer.render(scene, camera);
+        }
+        // Queued right after the render, before the next one reuses state.
+        reads.push(readWebGPUPixel(renderer, target, buffers[name]));
+      }
+    } finally {
+      for (const nodes of byByte.values()) {
+        for (const node of nodes) node.visible = true;
+      }
+      this.restorePickables();
+      if (shadowMap) {
+        shadowMap.autoUpdate = prevShadowAutoUpdate;
+        shadowMap.needsUpdate = prevShadowNeedsUpdate;
+      }
+      scene.overrideMaterial = prevOverrideMaterial;
+      scene.background = prevBackground;
+      renderer.setRenderTarget(prevTarget);
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+    }
+
+    // The decode outlives this call: it gets its own camera and NDC.
+    const owned = new PickCamera();
+    owned.copy(camera);
+    owned.matrixWorld.copy(camera.matrixWorld);
+    owned.matrixWorldInverse.copy(camera.matrixWorldInverse);
+    owned.projectionMatrix.copy(camera.projectionMatrix);
+    owned.projectionMatrixInverse.copy(camera.projectionMatrixInverse);
+    const reversed = (renderer as any).reversedDepthBuffer === true;
+    const frame: PickFrame = {
+      byteToModel: byteToModel!,
+      camera: owned,
+      // The centre of a 1×1 target is exactly `ndc`.
+      ndc: ndc.clone(),
+      reversedDepth: reversed,
+      unitDepth: true,
+    };
+    return { frame, buffers, reads };
+  }
+
+  /**
+   * Runs every {@link pickDepthContributors} entry into
+   * {@link _contributorTarget}, scissored to the pixel under `ndc`, and
+   * decodes the nearest contributed surface there, or `null`.
+   *
+   * Unlike the BIM pick (1×1 target through a narrowed camera) contributors
+   * render through the unmodified world camera into a drawing-buffer-sized
+   * target, so their own screen-space sizing (point size, splat footprint)
+   * matches what is on screen. The scissor keeps it a one-pixel job.
+   */
+  private pickContributors(ndc: THREE.Vector2): THREE.Vector3 | null {
+    if (this.pickDepthContributors.size === 0) return null;
+    if (!this.enabled || !this.world.renderer) return null;
+    const renderer = this.world.renderer.three;
+    // WebGPU: contributors hand over GLSL depth-pack materials, which a
+    // WebGPURenderer cannot run. A node-material path belongs to the WebGPU
+    // picker; until it exists, contributors simply don't take part.
+    if ((renderer as { isWebGPURenderer?: boolean }).isWebGPURenderer) {
+      return null;
+    }
+    const size = renderer.getDrawingBufferSize(this._contributorSize);
+    const width = size.x;
+    const height = size.y;
+    if (width === 0 || height === 0) return null;
+
+    if (!this._contributorTarget) {
+      this._contributorTarget = new THREE.WebGLRenderTarget(width, height, {
+        format: THREE.RGBAFormat,
+        type: THREE.UnsignedByteType,
+        minFilter: THREE.NearestFilter,
+        magFilter: THREE.NearestFilter,
+        depthBuffer: true,
+      });
+    } else if (
+      this._contributorTarget.width !== width ||
+      this._contributorTarget.height !== height
+    ) {
+      this._contributorTarget.setSize(width, height);
+    }
+    const target = this._contributorTarget;
+
+    const camera = this.world.camera.three;
+    camera.updateWorldMatrix(true, false);
+
+    const x = THREE.MathUtils.clamp(
+      Math.floor((ndc.x + 1) * 0.5 * width),
+      0,
+      width - 1,
+    );
+    const y = THREE.MathUtils.clamp(
+      Math.floor((ndc.y + 1) * 0.5 * height),
+      0,
+      height - 1,
+    );
+    const dpr = renderer.getPixelRatio();
+    const scissor = this._contributorScissor.set(
+      x / dpr,
+      y / dpr,
+      1 / dpr,
+      1 / dpr,
+    );
+    // A bound render target uses its own scissor (in target pixels).
+    target.scissor.set(x, y, 1, 1);
+    target.scissorTest = true;
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    const prevClearColor = renderer.getClearColor(this._clearColor);
+    const prevClearAlpha = renderer.getClearAlpha();
+    const { shadowMap } = renderer;
+    const prevShadowAutoUpdate = shadowMap.autoUpdate;
+    const prevShadowNeedsUpdate = shadowMap.needsUpdate;
+
+    const pixel = this._contributorPixel;
+    pixel.fill(0);
+    try {
+      shadowMap.autoUpdate = false;
+      shadowMap.needsUpdate = false;
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 0);
+      renderer.autoClear = false;
+      renderer.clear(true, true, false);
+      for (const contribute of this.pickDepthContributors) {
+        try {
+          contribute({ renderer, camera, target, scissor });
+        } catch {
+          // A misbehaving contributor must not break the pick.
+        }
+        // A contributor may rebind; re-assert before the next one / readback.
+        renderer.setRenderTarget(target);
+      }
+      renderer.readRenderTargetPixels(target, x, y, 1, 1, pixel);
+    } finally {
+      shadowMap.autoUpdate = prevShadowAutoUpdate;
+      shadowMap.needsUpdate = prevShadowNeedsUpdate;
+      renderer.setRenderTarget(prevTarget);
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+    }
+
+    const capabilities = renderer.capabilities as
+      | { reversedDepthBuffer?: boolean }
+      | undefined;
+    return decodePoint(pixel, {
+      byteToModel: this._byteToModel,
+      camera,
+      ndc: this._contributorNdc.set(
+        ((x + 0.5) / width) * 2 - 1,
+        ((y + 0.5) / height) * 2 - 1,
+      ),
+      reversedDepth: capabilities?.reversedDepthBuffer === true,
+      // WebGL only (contributors are skipped under WebGPU): as `renderPick`.
+      unitDepth: capabilities?.reversedDepthBuffer === true,
+    });
+  }
+
+  /**
+   * Renders every {@link PickOutput} for the region around `ndc` in a single
+   * render, then reads the outputs named in `request` from the centre pixel of
+   * `target` into `out`.
+   *
+   * `target` needs one attachment per output. Its size is the size of the
+   * rendered region in viewport pixels: 1×1 for a pick, the whole viewport
+   * centred on the origin for the debug overlay.
+   *
+   * The scene is left exactly as found, even if rendering throws.
+   */
+  private renderPick(
+    ndc: THREE.Vector2,
+    request: PickRequest,
+    target: THREE.WebGLRenderTarget,
+    out: PickBuffers,
+  ): PickFrame | null {
+    if (!this.enabled || !this.world.renderer) return null;
+    // `overrideMaterial` only applies to a `THREE.Scene`.
+    const scene = this.world.scene.three as THREE.Scene;
+    if (!scene.isScene) return null;
+    const fragments = this.components.get(FragmentsManager);
+    if (!fragments.initialized || fragments.list.size === 0) return null;
+
+    const renderer = this.world.renderer.three;
+    const viewport = renderer.getSize(this._viewportSize);
+    if (viewport.x === 0 || viewport.y === 0) return null;
+
+    const camera = this.snapshotCamera(ndc, viewport, target);
+
+    const material = this._pickMaterial;
+    material.clippingPlanes = this.collectLocalPlanes(this.world.renderer);
+
+    const prevTarget = renderer.getRenderTarget();
+    const prevAutoClear = renderer.autoClear;
+    const prevClearColor = renderer.getClearColor(this._clearColor);
+    const prevClearAlpha = renderer.getClearAlpha();
+    const prevBackground = scene.background;
+    const prevOverrideMaterial = scene.overrideMaterial;
+    const { shadowMap } = renderer;
+    const prevShadowAutoUpdate = shadowMap.autoUpdate;
+    const prevShadowNeedsUpdate = shadowMap.needsUpdate;
+
+    try {
+      this.collectPickables(scene, fragments);
+      if (this._byteToModel.size === 0) return null;
+
+      // A non-null scene background makes three force-clear colour AND depth
+      // on render() and paints the background colour into pixels with no
+      // geometry, which then decode to a bogus hit instead of void
+      // (issues #737 / #773).
+      scene.background = null;
+      scene.overrideMaterial = material;
+      // `render()` refreshes shadow maps every call. The pick reads no
+      // shadows, and must not consume a refresh the app requested.
+      shadowMap.autoUpdate = false;
+      shadowMap.needsUpdate = false;
+
+      renderer.setRenderTarget(target);
+      renderer.setClearColor(0x000000, 0);
+      renderer.autoClear = false;
+      renderer.clear(true, true, false);
+      renderer.render(scene, camera);
+    } finally {
+      this.restorePickables();
+      shadowMap.autoUpdate = prevShadowAutoUpdate;
+      shadowMap.needsUpdate = prevShadowNeedsUpdate;
+      scene.overrideMaterial = prevOverrideMaterial;
+      scene.background = prevBackground;
+      renderer.setRenderTarget(prevTarget);
+      renderer.autoClear = prevAutoClear;
+      renderer.setClearColor(prevClearColor, prevClearAlpha);
+    }
+
+    // `readRenderTargetPixels` is the one synchronous GPU sync of the pick;
+    // reading the other attachments afterwards is a plain copy.
+    const x = Math.floor(target.width / 2);
+    const y = Math.floor(target.height / 2);
+    for (const name of PICK_OUTPUT_NAMES) {
+      if (!request[name]) continue;
+      const pixel = out[name];
+      // clear the previous pick.
+      pixel.fill(0);
+      const attachment = PickOutput[name];
+      renderer.readRenderTargetPixels(
+        target,
+        x,
+        y,
+        1,
+        1,
+        pixel,
+        undefined,
+        attachment,
+      );
+    }
+
+    this._pickNdc.set(
+      ((x + 0.5) / target.width) * 2 - 1,
+      ((y + 0.5) / target.height) * 2 - 1,
+    );
+    // Optional: renderers standing in for WebGLRenderer may not carry it.
+    const capabilities = renderer.capabilities as
+      | { reversedDepthBuffer?: boolean }
+      | undefined;
+    return {
+      byteToModel: this._byteToModel,
+      camera,
+      ndc: this._pickNdc,
+      reversedDepth: capabilities?.reversedDepthBuffer === true,
+      unitDepth: capabilities?.reversedDepthBuffer === true,
+    };
+  }
+
+  /**
+   * Copies the world camera into the pick camera and narrows its projection
+   * to a `target`-sized region of the viewport centred on `ndc`, the
+   * classic pick matrix: `P' = M · P`.
+   *
+   * - Frustum culling then skips every mesh whose bounds miss that region,
+   *   so only meshes under the cursor are drawn at all.
+   * - `M` leaves the depth row alone, so depth decodes as usual.
+   * - The centre of a 1×1 target is exactly `ndc`: no NDC → pixel rounding,
+   *   no scissor, no device pixel ratio to account for.
+   * - The world camera is never modified, and custom projections work.
+   */
+  private snapshotCamera(
+    ndc: THREE.Vector2,
+    viewport: THREE.Vector2,
+    target: THREE.WebGLRenderTarget,
+  ) {
+    const source = this.world.camera.three;
+    source.updateWorldMatrix(true, false);
+
+    const camera = this._pickCamera;
+    camera.matrixWorld.copy(source.matrixWorld);
+    camera.matrixWorldInverse.copy(source.matrixWorldInverse);
+    camera.layers.mask = source.layers.mask;
+
+    const sx = viewport.x / target.width;
+    const sy = viewport.y / target.height;
+    // prettier-ignore
+    this._pickMatrix.set(
+      sx, 0, 0, -ndc.x * sx,
+      0, sy, 0, -ndc.y * sy,
+      0, 0, 1, 0,
+      0, 0, 0, 1,
+    );
+    camera.projectionMatrix.multiplyMatrices(
+      this._pickMatrix,
+      source.projectionMatrix,
+    );
+    camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+    return camera;
+  }
+
+  /**
+   * The planes the pick material clips by, so picks match what is on screen.
+   *
+   * - Global planes (`three.clippingPlanes`) are applied by three to every
+   *   material on its own. Listing them here too would clip by each twice.
+   * - Local planes (`isLocal`, see `Clipper.localClippingPlanes`) stay out of
+   *   that list and reach only the tile materials, so the pick material has
+   *   to carry them itself.
+   */
+  private collectLocalPlanes(renderer: BaseRenderer) {
+    const planes = this._localPlanes;
+    planes.length = 0;
+    for (const plane of renderer.clippingPlanes) {
+      if ((plane as { isLocal?: boolean }).isLocal) planes.push(plane);
+    }
+    return planes;
+  }
+
+  /**
+   * Walks the scene once and decides what the pick render draws:
+   *
+   * - Shells owned by a model, i.e. meshes carrying the per-vertex `id`
+   *   attribute, are drawn and tagged with their model's byte. Ownership
+   *   is the nearest model root above the mesh: a delta model's object is
+   *   parented under its parent model's object (see the fragments
+   *   EditHelper) but keeps its own byte.
+   * - Every other renderable is hidden:
+   *   - LOD line meshes, which fragments draws in place of small or distant
+   *     items, carry no `id`. Drawn, the missing attribute would read as
+   *     `(0, 0, 0, 1)` and write `itemId + 1 = 1`, i.e. a false hit on item 0,
+   *     while occluding the real shell behind it. Hidden, the item they stand
+   *     for simply isn't pickable, though the worker raycast still reports it.
+   *   - Non-BIM objects (helpers, grids, annotation lines, sprites) would
+   *     write their own colors into the pick outputs.
+   *
+   * Invisible subtrees are skipped: three won't draw them, and it leaves
+   * fragments' own tile visibility (stale LOD stages, hidden items) as is.
+   */
+  private collectPickables(scene: THREE.Scene, fragments: FragmentsManager) {
+    this._byteToModel.clear();
+    this._modelBytes.clear();
+    for (const [modelId, model] of fragments.list) {
+      this._modelRoots.set(model.object, modelId);
+    }
+
+    const nodes = this._walkNodes;
+    const owners = this._walkOwners;
+    nodes.push(scene);
+    owners.push(null);
+    while (nodes.length) {
+      const node = nodes.pop()!;
+      const inherited = owners.pop() as string | null;
+      if (!node.visible) continue;
+      const owner = this._modelRoots.get(node) ?? inherited;
+
+      if (isRenderable(node)) {
+        const byte = owner === null ? 0 : this.pickableByte(node, owner);
+        if (!byte) {
+          node.visible = false;
+          this._hidden.push(node);
+          continue;
+        }
+        this._meshBytes.set(node, byte);
+      }
+
+      for (const child of node.children) {
+        nodes.push(child);
+        owners.push(owner);
+      }
+    }
+  }
+
+  /**
+   * The byte to draw `node` with, or 0 if it isn't a pickable shell of
+   * `modelId`. Bytes are handed out on a model's first shell, so models with
+   * nothing on screen don't use one up.
+   */
+  private pickableByte(node: THREE.Object3D, modelId: string) {
+    const mesh = node as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.geometry?.attributes?.id) return 0;
+
+    let byte = this._modelBytes.get(modelId);
+    if (byte === undefined) {
+      byte = this._byteToModel.size + 1;
+      if (byte > FastModelPicker.MAX_MODELS) return 0;
+      this._modelBytes.set(modelId, byte);
+      this._byteToModel.set(byte, modelId);
+    }
+
+    this.allowOverride(mesh.material);
+    return byte;
+  }
+
+  /**
+   * Three skips `scene.overrideMaterial` for materials with
+   * `allowOverride === false`, which would draw a shell with its own shader
+   * into the pick outputs.
+   */
+  private allowOverride(material: THREE.Material | THREE.Material[]) {
+    if (Array.isArray(material)) {
+      for (const entry of material) this.allowOverride(entry);
+      return;
+    }
+    if (!material || material.allowOverride !== false) return;
+    material.allowOverride = true;
+    this._forcedOverrides.push(material);
+  }
+
+  private restorePickables() {
+    for (const object of this._hidden) object.visible = true;
+    for (const material of this._forcedOverrides) {
+      material.allowOverride = false;
+    }
+    this._hidden.length = 0;
+    this._forcedOverrides.length = 0;
+    this._walkNodes.length = 0;
+    this._walkOwners.length = 0;
+    this._meshBytes.clear();
+    this._modelRoots.clear();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Setup / teardown
+  // ---------------------------------------------------------------------------
+
+  /**
+   * The pick shader. Writes one output per {@link PickOutput} attachment:
+   *
+   * - `id`: `(modelByte, idMid, idLo1, idLo0)`. The vertex `id` attribute
+   *   holds the four bytes of `itemId + 1` (big-endian, non-normalized
+   *   `Uint8Array`, so each component is 0–255 as a float). `itemId` is
+   *   bounded by the item count per model, so its high byte is always 0
+   *   and R is free for the model byte, set per draw from
+   *   {@link collectPickables}.
+   * - `depth`: `gl_FragCoord.z` packed into four bytes, inverse of
+   *   {@link unpackDepthFromRGBA}:
+   *     r = fract(v * 256^3)  (least significant)
+   *     g = fract(v * 256^2)
+   *     b = fract(v * 256)
+   *     a = v                 (most significant)
+   *   `r.yzw -= r.xyz / 256` shaves the residual from each higher component
+   *   so the encoded value is exact, and the final `* 256/255` upscale lands
+   *   `v = 1.0` at all-255 bytes rather than rolling over to 0. Packed by
+   *   hand: `ShaderMaterial` doesn't reliably resolve three's `packing`
+   *   chunk for custom shaders.
+   * - `normal`: world-space normal as `normal * 0.5 + 0.5` in RGB, alpha 1.
+   *   Flipped on backfaces so consumers get the surface they're looking at.
+   *   ~1° precision per axis, plenty for surface alignment, orbiting and
+   *   snapping.
+   *
+   * Every output is written on every draw: rasterizing one pixel, the only
+   * per-output cost worth saving is the readback, which
+   * {@link renderPick} skips for outputs it wasn't asked for. Per-request
+   * shader variants would each cost a program compile instead.
+   */
+  private buildPickMaterial(): THREE.ShaderMaterial {
+    const material = new THREE.ShaderMaterial({
+      glslVersion: THREE.GLSL3,
+      uniforms: { modelByte: { value: 0 } },
+      vertexShader: `
+        attribute vec4 id;
+        varying vec4 vId;
+        varying vec3 vWorldNormal;
+        #if NUM_CLIPPING_PLANES > 0
+          varying vec3 vClipPosition;
+        #endif
+        void main() {
+          vId = id;
+          vWorldNormal = normalize((modelMatrix * vec4(normal, 0.0)).xyz);
+          vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+          #if NUM_CLIPPING_PLANES > 0
+            vClipPosition = -mvPosition.xyz;
+          #endif
+          gl_Position = projectionMatrix * mvPosition;
+        }
+      `,
+      fragmentShader: `
+        precision highp float;
+        uniform float modelByte;
+        varying vec4 vId;
+        varying vec3 vWorldNormal;
+        #if NUM_CLIPPING_PLANES > 0
+          varying vec3 vClipPosition;
+          uniform vec4 clippingPlanes[NUM_CLIPPING_PLANES];
+        #endif
+        layout(location = ${PickOutput.id}) out highp vec4 outId;
+        layout(location = ${PickOutput.depth}) out highp vec4 outDepth;
+        layout(location = ${PickOutput.normal}) out highp vec4 outNormal;
+        void main() {
+          #if NUM_CLIPPING_PLANES > 0
+            for (int i = 0; i < NUM_CLIPPING_PLANES; i++) {
+              vec4 plane = clippingPlanes[i];
+              if (dot(vClipPosition, plane.xyz) > plane.w) discard;
+            }
+          #endif
+          outId = vec4(modelByte / 255.0, vId.y / 255.0, vId.z / 255.0, vId.w / 255.0);
+
+          float v = gl_FragCoord.z;
+          vec4 r = vec4(
+            fract(v * 16777216.0),
+            fract(v * 65536.0),
+            fract(v * 256.0),
+            v
+          );
+          r.yzw -= r.xyz * (1.0 / 256.0);
+          outDepth = r * (256.0 / 255.0);
+
+          vec3 n = normalize(vWorldNormal);
+          if (!gl_FrontFacing) n = -n;
+          outNormal = vec4(n * 0.5 + 0.5, 1.0);
+        }
+      `,
+      side: THREE.DoubleSide,
+      // Three binds the `clippingPlanes` uniform only when it builds the
+      // program for a `ShaderMaterial` with `clipping` on, but sizes
+      // NUM_CLIPPING_PLANES either way. Left on, so the shader never sees
+      // planes it has no values for. With no planes the loop compiles out.
+      clipping: true,
+    });
+
+    // One material draws every model, so the model byte is set per draw.
+    material.onBeforeRender = (
+      _renderer,
+      _scene,
+      _camera,
+      _geometry,
+      object,
+    ) => {
+      material.uniforms.modelByte.value = this._meshBytes.get(object) ?? 0;
+      material.uniformsNeedUpdate = true;
+    };
+
+    return material;
+  }
+
+  private setupDebugCanvas() {
+    if (this._debugCanvas) return;
+    const size = this.world.renderer!.three.getSize(new THREE.Vector2());
+
+    this._debugContainer = document.createElement("div");
+    this._debugContainer.style.position = "fixed";
+    this._debugContainer.style.top = "10px";
+    this._debugContainer.style.right = "10px";
+    this._debugContainer.style.width = "300px";
+    this._debugContainer.style.height = "300px";
+    this._debugContainer.style.border = "2px solid #fff";
+    this._debugContainer.style.backgroundColor = "#000";
+    this._debugContainer.style.zIndex = "10000";
+    this._debugContainer.style.pointerEvents = "none";
+
+    this._debugCanvas = document.createElement("canvas");
+    this._debugCanvas.width = size.x;
+    this._debugCanvas.height = size.y;
+    this._debugCanvas.style.width = "100%";
+    this._debugCanvas.style.height = "100%";
+    this._debugCanvas.style.imageRendering = "pixelated";
+    this._debugContainer.appendChild(this._debugCanvas);
+    document.body.appendChild(this._debugContainer);
+  }
+
+  private removeDebugCanvas() {
+    if (this._debugContainer) {
+      this._debugContainer.remove();
+      this._debugContainer = undefined;
+      this._debugCanvas = undefined;
+    }
+  }
+
+  /**
+   * Renders the pick for the whole viewport into {@link _debugTarget} and
+   * mirrors its id output to the debug canvas.
+   */
+  private updateDebugCanvas() {
+    if (!this._debugCanvas || !this.world.renderer) return;
+    // The overlay reads the whole viewport synchronously: WebGL only.
+    if (this.isWebGPU()) return;
+    const renderer = this.world.renderer.three;
+    const size = renderer.getSize(new THREE.Vector2());
+    const width = Math.floor(size.x);
+    const height = Math.floor(size.y);
+    if (width === 0 || height === 0) return;
+
+    this._debugTarget ??= createPickTarget(width, height);
+    const target = this._debugTarget;
+    target.setSize(width, height);
+    if (!this.renderPick(ORIGIN, NO_REQUEST, target, this._pickBuffers)) return;
+
+    const pixels = new Uint8Array(width * height * 4);
+    renderer.readRenderTargetPixels(
+      target,
+      0,
+      0,
+      width,
+      height,
+      pixels,
+      undefined,
+      PickOutput.id,
+    );
+
+    const canvas = this._debugCanvas;
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    const imageData = ctx.createImageData(width, height);
+    // Flip Y axis: WebGL has Y=0 at bottom, canvas 2D has Y=0 at top.
+    const rowSize = width * 4;
+    for (let y = 0; y < height; y++) {
+      const srcOffset = y * rowSize;
+      const dstOffset = (height - 1 - y) * rowSize;
+      imageData.data.set(
+        pixels.subarray(srcOffset, srcOffset + rowSize),
+        dstOffset,
+      );
+    }
+    ctx.putImageData(imageData, 0, 0);
+  }
+}

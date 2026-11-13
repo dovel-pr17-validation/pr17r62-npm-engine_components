@@ -1,0 +1,392 @@
+import {
+	ShaderMaterial,
+	GLSL3,
+	WebGLRenderTarget,
+	Box3,
+	Vector3,
+	Vector4,
+	OrthographicCamera,
+	Color,
+	Scene,
+	NoBlending,
+	DoubleSide,
+} from 'three';
+// Namespace import for the OPTIONAL WebGPU surface (NodeMaterial, TSL): a
+// NAMED import of those would be undefined under the classic build, and a
+// static `class extends` of it would crash this module on load there.
+import * as THREE_NS from 'three';
+
+// RGBA8 ID encoding - supports up to 16,777,215 objects (2^24 - 1)
+// ID 0 is valid, background is indicated by alpha = 0
+function encodeId( id, target ) {
+
+	target.x = ( id & 0xFF ) / 255;
+	target.y = ( ( id >> 8 ) & 0xFF ) / 255;
+	target.z = ( ( id >> 16 ) & 0xFF ) / 255;
+	target.w = 1;
+
+}
+
+function decodeId( buffer, index ) {
+
+	return buffer[ index ] | ( buffer[ index + 1 ] << 8 ) | ( buffer[ index + 2 ] << 16 );
+
+}
+
+function throwIfAborted( signal ) {
+
+	if ( signal && signal.aborted ) {
+
+		throw new Error( 'VisibilityCuller: Process aborted via AbortSignal.' );
+
+	}
+
+}
+
+function collectAllObjects( objects ) {
+
+	const result = new Set();
+	objects.traverse( c => {
+
+		if ( c.isMesh ) {
+
+			result.add( c );
+
+		}
+
+	} );
+
+	return Array.from( result );
+
+}
+
+// TODO: WebGPU or occlusion queries would let us accelerate this. Ideally would we "contract" the depth buffer by one pixel by
+// taking the lowest value from all surrounding pixels in order to avoid mesh misses.
+export class VisibilityCuller {
+
+	constructor( renderer, options = {} ) {
+
+		const { pixelsPerMeter = 0.1 } = options;
+
+		this.pixelsPerMeter = pixelsPerMeter;
+		this.renderer = renderer;
+
+	}
+
+	async cull( objects, options = {} ) {
+
+		const { signal = null } = options;
+		throwIfAborted( signal );
+
+		objects = collectAllObjects( objects );
+
+		const { renderer, pixelsPerMeter } = this;
+		const size = new Vector3();
+		const camera = new OrthographicCamera();
+		const box = new Box3();
+
+		const target = new WebGLRenderTarget( 1, 1 );
+
+		// get the bounds of the image
+		box.makeEmpty();
+		objects.forEach( o => {
+
+			box.expandByObject( o );
+
+		} );
+
+		// get the bounds dimensions
+		box.getSize( size );
+
+		// calculate the tile and target size
+		// WebGL exposes the max texture size on `capabilities`; the WebGPURenderer
+		// has no `capabilities` and carries the limit on its backend device instead.
+		const rendererMaxTexture =
+			renderer.capabilities?.maxTextureSize ??
+			renderer.backend?.device?.limits?.maxTextureDimension2D ??
+			2 ** 13;
+		const maxTextureSize = Math.min( rendererMaxTexture, 2 ** 13 );
+		const webgpu = renderer.isWebGPURenderer === true;
+		const pixelWidth = Math.ceil( size.x / pixelsPerMeter );
+		const pixelHeight = Math.ceil( size.z / pixelsPerMeter );
+		const tilesX = Math.ceil( pixelWidth / maxTextureSize );
+		const tilesY = Math.ceil( pixelHeight / maxTextureSize );
+
+		target.setSize( Math.ceil( pixelWidth / tilesX ), Math.ceil( pixelHeight / tilesY ) );
+
+		// set the camera bounds
+		// A margin above the top and below the bottom of the box keeps the whole
+		// depth range strictly inside the frustum. Without it, geometry sitting
+		// exactly at box.max.y (the top face of the tallest items) fell inside the
+		// near-clip band and never rasterized, so those items were reported as not
+		// visible and produced no edges. Which items that hit depended on what else
+		// was in the set, since box.max.y is the set's own bound.
+		const yMargin = Math.max( size.y, 1 ) * 0.01;
+		camera.rotation.x = - Math.PI / 2;
+		camera.near = 0;
+		camera.far = size.y + 2 * yMargin;
+		camera.position.y = box.max.y + yMargin;
+
+		// Create a scene with all objects using ID materials
+		const idScene = new Scene();
+		const originalMaterials = new Map();
+		const originalParents = new Map();
+		const idMaterials = [];
+
+		for ( let i = 0; i < objects.length; i ++ ) {
+
+			const object = objects[ i ];
+
+			// Store original material and parent
+			originalMaterials.set( object, object.material );
+			originalParents.set( object, object.parent );
+
+			// Create and assign ID material
+			// WebGPU: the TSL twin (a NodeMaterial whose fragment IS the id
+			// uniform); WebGL keeps the GLSL3 IDMaterial below.
+			const idMaterial = webgpu ? newIdNodeMaterial() : new IDMaterial();
+			idMaterial.objectId = i;
+			idMaterials.push( idMaterial );
+			object.material = idMaterial;
+
+			// Add to ID scene
+			idScene.add( object );
+
+		}
+
+		// save render state
+		const color = renderer.getClearColor( new Color() );
+		const alpha = renderer.getClearAlpha();
+		const renderTarget = renderer.getRenderTarget();
+		const autoClear = renderer.autoClear;
+
+		const readBuffer = new Uint8Array( target.width * target.height * 4 );
+		const visibleSet = new Set();
+		const stepX = size.x / tilesX;
+		const stepZ = size.z / tilesY;
+
+		// Everything mutated above and below (swapped materials, reparented
+		// objects, renderer target / clear color / autoClear) must be put back
+		// exactly once, whichever comes first: the loop finishing, a readback
+		// rejecting (lost context...), or the signal aborting.
+		let restored = false;
+		const restore = () => {
+
+			if ( restored ) return;
+			restored = true;
+
+			if ( signal ) signal.removeEventListener( 'abort', restore );
+
+			// Restore original materials and re-add to original parents
+			for ( const object of objects ) {
+
+				object.material = originalMaterials.get( object );
+				const originalParent = originalParents.get( object );
+				if ( originalParent ) {
+
+					originalParent.add( object );
+
+				} else {
+
+					idScene.remove( object );
+
+				}
+
+			}
+
+			// reset render state
+			renderer.setClearColor( color, alpha );
+			renderer.setRenderTarget( renderTarget );
+			renderer.autoClear = autoClear;
+
+			// dispose of intermediate values. A readback still in flight only
+			// waits on its own pixel buffer, not on the target, so disposing
+			// here is safe.
+			for ( const material of idMaterials ) {
+
+				material.dispose();
+
+			}
+
+			target.dispose();
+
+		};
+
+		// An abort restores synchronously, from the listener: a readback can take
+		// a second or more, and the caller's promise rejects on its next frame.
+		// Waiting for the loop to notice would leave the caller's renderer bound
+		// to our target, drawing into it, after it was told the task is over.
+		if ( signal ) signal.addEventListener( 'abort', restore );
+
+		try {
+
+			// render ids
+			renderer.autoClear = true;
+			renderer.setClearColor( 0, 0 );
+			renderer.setRenderTarget( target );
+
+			for ( let tx = 0; tx < tilesX; tx ++ ) {
+
+				for ( let ty = 0; ty < tilesY; ty ++ ) {
+
+					// Calculate tile bounds in world space
+					const tileMinX = box.min.x + stepX * tx;
+					const tileMaxX = tileMinX + stepX;
+					const tileMinZ = box.min.z + stepZ * ty;
+					const tileMaxZ = tileMinZ + stepZ;
+
+					// Position camera at center of this tile, keeping the same top
+					// margin as above so nothing at box.max.y is near-clipped.
+					const tileCenterX = ( tileMinX + tileMaxX ) / 2;
+					const tileCenterZ = ( tileMinZ + tileMaxZ ) / 2;
+					camera.position.set( tileCenterX, box.max.y + yMargin, tileCenterZ );
+
+					// Set symmetric frustum around camera center
+					// For a camera looking down (-90° X rotation):
+					// - camera left/right map to world X
+					// - camera top/bottom map to world -Z/+Z (inverted)
+					const halfWidth = stepX / 2;
+					const halfHeight = stepZ / 2;
+					camera.left = - halfWidth;
+					camera.right = halfWidth;
+					camera.top = halfHeight;
+					camera.bottom = - halfHeight;
+
+					camera.updateProjectionMatrix();
+
+					// Once aborted, the renderer and the objects are already the
+					// caller's again: render nothing more.
+					throwIfAborted( signal );
+
+					// Single render call for all objects in this tile
+					renderer.render( idScene, camera );
+
+					// The two renderers disagree on this SIGNATURE: WebGL fills the
+					// buffer passed as the 6th argument (and returns it); WebGPU's 6th
+					// argument is a texture index and the pixels come back as the
+					// resolved value.
+					const buffer = webgpu
+						? await renderer.readRenderTargetPixelsAsync( target, 0, 0, target.width, target.height )
+						: await renderer.readRenderTargetPixelsAsync( target, 0, 0, target.width, target.height, readBuffer );
+					throwIfAborted( signal );
+
+					// find all visible objects - decode RGBA to ID
+					for ( let i = 0, l = buffer.length; i < l; i += 4 ) {
+
+						// alpha = 0 indicates background (no object)
+						if ( buffer[ i + 3 ] === 0 ) continue;
+
+						const id = decodeId( buffer, i );
+						visibleSet.add( objects[ id ] );
+
+					}
+
+				}
+
+			}
+
+		} finally {
+
+			restore();
+
+		}
+
+		return Array.from( visibleSet );
+
+	}
+
+}
+
+
+class IDMaterial extends ShaderMaterial {
+
+	get objectId() {
+
+		return this._objectId;
+
+	}
+
+	set objectId( v ) {
+
+		this._objectId = v;
+		encodeId( v, this.uniforms.objectId.value );
+
+	}
+
+	constructor( params ) {
+
+		super( {
+
+			glslVersion: GLSL3,
+			blending: NoBlending,
+			// A flat item (a slab) seen straight down shows only one face; if its
+			// winding puts the back face toward the camera it wouldn't rasterize and
+			// the item would be culled. The pass only cares about coverage, so render
+			// both sides.
+			side: DoubleSide,
+
+			uniforms: {
+				objectId: { value: new Vector4() },
+			},
+
+			vertexShader: /* glsl */`
+				void main() {
+
+					gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+
+				}
+			`,
+
+			fragmentShader: /* glsl */`
+				layout(location = 0) out vec4 out_id;
+				uniform vec4 objectId;
+
+				void main() {
+
+					out_id = objectId;
+
+				}
+			`,
+
+		} );
+
+		this._objectId = 0;
+		this.setValues( params );
+
+	}
+
+}
+
+// The TSL twin of IDMaterial for a WebGPU renderer: a NodeMaterial whose
+// fragment output IS the encoded id uniform. Built as a FACTORY (not a
+// class extends) so this module still loads under the classic build, where
+// NodeMaterial does not exist. Same `objectId` get/set surface via
+// encodeId, same NoBlending and DoubleSide.
+function newIdNodeMaterial() {
+
+	const material = new THREE_NS.NodeMaterial();
+	material.blending = NoBlending;
+	material.side = DoubleSide;
+
+	const objectId = THREE_NS.TSL.uniform( new Vector4() );
+	material.fragmentNode = objectId;
+	material.uniforms = { objectId };
+
+	material._objectId = 0;
+	Object.defineProperty( material, 'objectId', {
+		get() {
+
+			return this._objectId;
+
+		},
+		set( v ) {
+
+			this._objectId = v;
+			encodeId( v, objectId.value );
+
+		},
+	} );
+
+	return material;
+
+}

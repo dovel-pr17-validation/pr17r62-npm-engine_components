@@ -1,0 +1,112 @@
+/// <reference types="vitest/config" />
+/* eslint-disable import/no-extraneous-dependencies */
+import dts from "vite-plugin-dts";
+import { defineConfig } from "vite";
+import * as path from "path";
+import pluginTerser from "@rollup/plugin-terser";
+import * as packageJson from "./package.json";
+
+// const generateTSNamespace = (dts: Map<string, string>) => {
+//   if (!fs.existsSync("./dist")) return;
+//   console.log("Generating namespace!");
+//   let types = "";
+//   dts.forEach((declaration) => {
+//     const cleanedType = declaration
+//       .replace(/export\s+\*?\s+from\s+"[^"]+";/g, "")
+//       .replace(/^\s*[\r\n]/gm, "")
+//       .replace(/`/g, "'");
+//     types += cleanedType;
+//   });
+//   fs.writeFileSync(
+//     "./dist/namespace.d.ts",
+//     `declare namespace OBC {\n${types}\n}`,
+//   );
+// };
+
+export default defineConfig({
+  build: {
+    outDir: "./dist",
+    minify: false,
+    lib: {
+      entry: path.resolve(__dirname, "./src/index.ts"),
+    },
+    rollupOptions: {
+      external: (id) => {
+        const peers = Object.keys(packageJson.peerDependencies);
+        return peers.some((p) => id === p || id.startsWith(`${p}/`));
+      },
+      output: [
+        {
+          entryFileNames: `index.mjs`,
+          format: "es",
+          globals: {
+            three: "THREE",
+            "@thatopen/fragments": "FRAGS",
+            "web-ifc": "WEB-IFC",
+          },
+        },
+        {
+          entryFileNames: `index.cjs`,
+          format: "cjs",
+          globals: {
+            three: "THREE",
+            "@thatopen/fragments": "FRAGS",
+            "web-ifc": "WEB-IFC",
+          },
+        },
+        {
+          entryFileNames: `index.min.mjs`,
+          plugins: [pluginTerser()],
+          format: "es",
+          globals: {
+            three: "THREE",
+            "@thatopen/fragments": "FRAGS",
+            "web-ifc": "WEB-IFC",
+          },
+        },
+        {
+          entryFileNames: `index.min.cjs`,
+          plugins: [pluginTerser()],
+          format: "cjs",
+          globals: {
+            three: "THREE",
+            "@thatopen/fragments": "FRAGS",
+            "web-ifc": "WEB-IFC",
+          },
+        },
+      ],
+    },
+  },
+  plugins: [
+    dts({
+      rollupTypes: true,
+      // This overrides tsconfig-build.json's exclude rather than adding to
+      // it, so the example files have to be repeated here or they come back
+      // in and report TS2307 for their doc-only imports.
+      exclude: [
+        "node_modules/**",
+        "./src/**/example.ts",
+        "./src/**/*.test.ts",
+        "./src/**/*.spec.ts",
+      ],
+    }),
+  ],
+  test: {
+    // The default environment is node: most of the suite is plain logic over
+    // three and fragments objects. A file that needs a DOM opts in with
+    //
+    //   // @vitest-environment happy-dom
+    //
+    // as its first line.
+    environment: "node",
+    environmentOptions: { happyDOM: { url: "https://localhost" } },
+    setupFiles: ["./vitest.setup.ts"],
+    snapshotFormat: {
+      maxDepth: Infinity,
+      maxWidth: Infinity,
+      maxOutputLength: Infinity,
+    },
+    // Green on a tree with no test files: the suites land in a later PR.
+    passWithNoTests: true,
+  },
+});
